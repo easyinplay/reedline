@@ -514,7 +514,40 @@ impl Painter {
                 size
             }
         };
-        let prompt_selector = select_prompt_row(suspended_state, self.stdout.cursor_position()?);
+        self.anchor_prompt(suspended_state)
+    }
+
+    /// Establishes the prompt's start row for a new line editor invocation by
+    /// asking the terminal where the cursor is.
+    fn anchor_prompt(&mut self, suspended_state: Option<&PainterSuspendedState>) -> Result<()> {
+        // The terminal may not answer the cursor-position query in time
+        // (crossterm gives it a fixed 2s): a terminal busy repainting, a
+        // multiplexer briefly holding the reply, a slow remote link. That is
+        // a transient condition, not a broken terminal, and this was the only
+        // query site that still aborted `read_line` on it. Degrade instead:
+        // print a newline so the prompt at least starts at column 0 on a row
+        // of its own, keep the row as `Stale` so the next paint's drift check
+        // asks again (and itself tolerates no answer), and carry on.
+        //
+        // The substitute row must be the bottom of the screen, never the
+        // last-known row. The drift check only re-anchors when the cursor
+        // turns out to be *above* the cached row, so a guess can only be
+        // repaired if it errs high. The newline just printed has already
+        // moved the cursor past the last-known row in the common REPL case,
+        // and `clear_from_anchor` erases down from the anchor, so an
+        // undershooting guess wipes the output above the prompt with no way
+        // to recover. No row is greater than the bottom, so it is the only
+        // guess that always lands on the repairable side.
+        let position = match self.stdout.cursor_position() {
+            Ok(position) => position,
+            Err(_) => {
+                self.print_crlf()?;
+                self.prompt_start_row =
+                    PromptStartRow::Stale(self.screen_height().saturating_sub(1));
+                return Ok(());
+            }
+        };
+        let prompt_selector = select_prompt_row(suspended_state, position);
         let new_row = match prompt_selector {
             PromptRowSelector::UseExistingPrompt { start_row } => start_row,
             PromptRowSelector::MakeNewPrompt { new_row } => {
@@ -1620,6 +1653,35 @@ mod tests {
             painter.state_before_suspension().was_flush_at_bottom,
             expected
         );
+    }
+
+    // Test writers never answer the cursor-position query (see
+    // `W::cursor_position`), which is exactly the terminal-didn't-reply case.
+    // Anchoring must then degrade rather than fail the whole `read_line`,
+    // and must guess the bottom row: the drift check only repairs a guess
+    // that errs high, and the newline printed first has already moved the
+    // cursor past any last-known row.
+    #[test]
+    fn test_anchor_prompt_without_answer_assumes_bottom_over_last_known_row() {
+        let mut painter = Painter::new(W::capture());
+        painter.terminal_size = (20, 10);
+        painter.prompt_start_row.mark_verified(4);
+
+        painter.anchor_prompt(None).unwrap();
+
+        assert_eq!(painter.prompt_start_row, PromptStartRow::Stale(9));
+        assert_eq!(painter.stdout.captured(), b"\r\n");
+    }
+
+    #[test]
+    fn test_anchor_prompt_without_answer_and_no_row_assumes_bottom() {
+        let mut painter = Painter::new(W::capture());
+        painter.terminal_size = (20, 10);
+
+        painter.anchor_prompt(None).unwrap();
+
+        assert_eq!(painter.prompt_start_row, PromptStartRow::Stale(9));
+        assert_eq!(painter.stdout.captured(), b"\r\n");
     }
 
     fn base_snapshot() -> RenderSnapshot {
